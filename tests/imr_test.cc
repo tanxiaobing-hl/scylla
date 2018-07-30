@@ -33,6 +33,9 @@
 #include "imr/fundamental.hh"
 #include "imr/compound.hh"
 #include "imr/methods.hh"
+#include "imr/utils.hh"
+
+#include "utils/logalloc.hh"
 
 #include "random-utils.hh"
 
@@ -714,6 +717,100 @@ BOOST_AUTO_TEST_CASE(test_variant_destructor) {
     imr::methods::destroy<V>(buffer, test_variant_context { true });
     BOOST_CHECK_EQUAL(object_with_destructor::destruction_count, 1);
     BOOST_CHECK_EQUAL(object_with_destructor::last_destroyed_one, value);
+}
+
+BOOST_AUTO_TEST_SUITE_END();
+
+BOOST_AUTO_TEST_SUITE(utils);
+
+struct exception_safety_structue_context {
+    size_t _size;
+
+    exception_safety_structue_context(const uint8_t* ptr)
+        : _size(imr::pod<size_t>::make_view(ptr).load())
+    {
+        BOOST_CHECK_EQUAL(_size, 4);
+    }
+    
+    template<typename Tag>
+    size_t size_of() const noexcept {
+        return _size;
+    }
+
+    template<typename Tag>
+    decltype(auto) context_for(...) const noexcept { return *this; }
+};
+
+struct exception_safety_nested_structue_context {
+    size_t _size;
+
+    exception_safety_nested_structue_context(const uint8_t* ptr)
+        : _size(imr::pod<size_t>::make_view(ptr).load())
+    {
+        BOOST_CHECK_NE(_size, 0);
+    }
+    
+    template<typename Tag>
+    size_t size_of() const noexcept {
+        return _size;
+    }
+
+    template<typename Tag>
+    decltype(auto) context_for(...) const noexcept { return *this; }
+};
+
+BOOST_AUTO_TEST_CASE(test_object_exception_safety) {
+    using structure = imr::structure<
+        imr::member<A, imr::pod<size_t>>,
+        imr::member<B, imr::buffer<A>>,
+        imr::member<C, imr::pod<void*>>,
+        imr::member<D, imr::pod<void*>>
+    >;
+
+    using context_factory_for_structure = imr::alloc::context_factory<exception_safety_structue_context>;
+    using lsa_migrator_fn_for_structure = imr::alloc::lsa_migrate_fn<structure, context_factory_for_structure>;
+    auto migrator_for_structure = lsa_migrator_fn_for_structure(context_factory_for_structure());
+
+    using nested_structure = imr::structure<
+        imr::member<A, imr::pod<size_t>>,
+        imr::member<B, imr::buffer<B>>
+    >;
+
+    using context_factory_for_nested_structure = imr::alloc::context_factory<exception_safety_nested_structue_context>;
+    using lsa_migrator_fn_for_nested_structure = imr::alloc::lsa_migrate_fn<structure, context_factory_for_nested_structure>;
+    auto migrator_for_nested_structure = lsa_migrator_fn_for_nested_structure(context_factory_for_nested_structure());
+
+    logalloc::region reg;
+    with_allocator(reg.allocator(), [&] {
+        BOOST_CHECK_THROW(
+            imr::utils::object<structure>::make([&] (auto serializer, auto& allocator) {
+                return serializer
+                    .serialize(4)
+                    .serialize(bytes(4, 'a'))
+                    .serialize(allocator.template allocate<nested_structure>(
+                        &migrator_for_nested_structure,
+                        [&] (auto nested_serializer) {
+                            return nested_serializer
+                                .serialize(128)
+                                .serialize(128, [] (auto&&...) { })
+                                .done();
+                        }
+                    ))
+                    .serialize(allocator.template allocate<nested_structure>(
+                        &migrator_for_nested_structure,
+                        [&] (auto nested_serializer) {
+                            return nested_serializer
+                                .serialize(128ull * 1024 * 1024 * 1024)
+                                .serialize(128ull * 1024 * 1024 * 1024, [] (auto&&...) { })
+                                .done();
+                        }
+                    ))
+                    .done();
+            }, &migrator_for_structure)
+        , std::bad_alloc);
+    });
+
+    BOOST_CHECK_EQUAL(reg.occupancy().used_space(), 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END();
